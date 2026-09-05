@@ -8,24 +8,20 @@ Plumtree sends a message to every node over a spanning tree, and repairs the tre
 gossip when a message is lost. It gives tree-cost delivery (one full message per edge) with
 gossip-level resilience.
 
-## Which Plumtree crate should you use?
-
-There is an older crate named [`plumtree`][sile] by sile (2018). It is also a pure state machine
-with an action model — the same core idea. Pick by the differences:
+## At a glance
 
 | | this crate (`plumtree-fsm`) | [`plumtree`][sile] (sile, 2018) |
 |---|---|---|
 | Type | `Plumtree<Id>` — one type parameter, the node id | `Node<S>` over a `System` trait with three associated types |
 | Payload | opaque `Vec<u8>` | a generic `MessagePayload` type you choose |
-| Getting actions out | `take_outbound()` drains the whole FIFO queue at once (`etcd/raft` `Ready` style) | `poll_action()` returns one action at a time |
+| Getting actions out | `ready()` drains the whole FIFO queue at once (`etcd/raft` `Ready` style) | `poll_action()` returns one action at a time |
 | Clock | you pass a logical `now` into each call | an internal clock you advance with `tick(duration)` |
 | Membership vs liveness | separate: `membership(added, removed)` and `down`/`up` | one path: `handle_neighbor_up`/`down` |
 | Tests | multi-node convergence under message loss and cluster churn | multi-node convergence, no loss, no churn |
 | Maintenance | active | last release 2018 |
 
-Use `plumtree-fsm` if you want the single output-queue contract, opaque byte payloads (a good
-fit for CRDT deltas), and tests that cover loss and churn. Use `plumtree` if you prefer a typed
-payload and the trait-based `System` abstraction.
+There is an older crate, [`plumtree`][sile] (2018), built on the same idea; the right column notes
+where this one differs.
 
 ## How it works
 
@@ -38,7 +34,7 @@ links stay ready to repair it.
 ## Driving it
 
 Every input — `broadcast`, `on_message`, `tick`, `membership`, `down`, `up` — changes state and
-appends to one FIFO outbound queue. You drain the queue with `take_outbound()` and run the
+appends to one FIFO outbound queue. You drain the queue with `ready()` and run the
 actions in order. You do not have to drain between inputs: call several, then drain once, and
 their outputs are in call order.
 
@@ -48,7 +44,7 @@ use plumtree_fsm::{Plumtree, Message, Action, Config};
 let mut n: Plumtree<u32> = Plumtree::new(1, [2, 3], [4], Config::default());
 
 n.broadcast(0, b"hello".to_vec());
-for a in n.take_outbound() {
+for a in n.ready() {
     match a {
         Action::Send(peer, msg) => { /* serialize msg, send to peer */ }
         Action::Deliver(payload) => { /* hand payload to the application */ }

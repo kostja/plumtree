@@ -27,7 +27,7 @@
 //! Every input — [`broadcast`](Plumtree::broadcast), [`on_message`](Plumtree::on_message),
 //! [`tick`](Plumtree::tick), [`membership`](Plumtree::membership) — mutates state and **appends
 //! to one FIFO outbound queue**. It returns nothing. You drain the queue with
-//! [`take_outbound`](Plumtree::take_outbound) and run the [`Action`]s in order.
+//! [`ready`](Plumtree::ready) and run the [`Action`]s in order.
 //!
 //! You do **not** have to drain between inputs. Call several inputs, then drain once; their
 //! outputs concatenate in call order. No input reads the queue, so nothing depends on when you
@@ -77,7 +77,7 @@
 //!
 //! let mut n: Plumtree<u32> = Plumtree::new(1, [2, 3], [4], Config::default());
 //! n.broadcast(0, b"hello".to_vec());
-//! let actions = n.take_outbound();
+//! let actions = n.ready();
 //! // A full push to each eager peer.
 //! assert!(actions.iter().any(|a| matches!(a, Action::Send(2, Message::Gossip { .. }))));
 //! assert!(actions.iter().any(|a| matches!(a, Action::Send(3, Message::Gossip { .. }))));
@@ -114,7 +114,7 @@ pub enum Message<Id> {
 }
 
 /// Something the caller must do: send a message, or deliver a received payload to the
-/// application. Actions come off [`take_outbound`](Plumtree::take_outbound) in FIFO order.
+/// application. Actions come off [`ready`](Plumtree::ready) in FIFO order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action<Id> {
     /// Send `Message` to this peer.
@@ -151,7 +151,7 @@ struct Missing<Id> {
 
 /// One node's Plumtree state.
 ///
-/// Generic over the node id `Id`. Feed it events; drain [`take_outbound`](Plumtree::take_outbound)
+/// Generic over the node id `Id`. Feed it events; drain [`ready`](Plumtree::ready)
 /// and run the [`Action`]s. See the crate docs for the contract.
 pub struct Plumtree<Id: Ord + Clone> {
     me: Id,
@@ -198,7 +198,7 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     /// Drain the outbound queue: the actions accumulated since the last drain, in FIFO order.
     /// Run each in order -- `Send` over your connection pool, `Deliver` to the application.
     #[must_use]
-    pub fn take_outbound(&mut self) -> Vec<Action<Id>> {
+    pub fn ready(&mut self) -> Vec<Action<Id>> {
         std::mem::take(&mut self.outbound)
     }
 
@@ -422,7 +422,7 @@ mod tests {
     fn broadcast_pushes_to_eager_and_queues_lazy() {
         let mut n: Plumtree<u32> = Plumtree::new(1, [2, 3], [4], Config::default());
         n.broadcast(0, b"x".to_vec());
-        let a = n.take_outbound();
+        let a = n.ready();
         // Full push to both eager peers, nothing to the lazy peer yet.
         assert_eq!(a.len(), 2);
         assert!(a.contains(&Action::Send(
@@ -436,7 +436,7 @@ mod tests {
         // The lazy peer is told on the next tick.
         n.tick(1);
         assert_eq!(
-            n.take_outbound(),
+            n.ready(),
             vec![Action::Send(4, Message::Ihave(vec![(1, 0)]))]
         );
     }
@@ -447,7 +447,7 @@ mod tests {
         let mut n: Plumtree<u32> = Plumtree::new(1, [2], [], Config::default());
         n.broadcast(0, b"a".to_vec());
         n.broadcast(0, b"b".to_vec());
-        let a = n.take_outbound();
+        let a = n.ready();
         assert_eq!(a.len(), 2);
         assert_eq!(
             a[0],
@@ -485,7 +485,7 @@ mod tests {
                 round: 0,
             },
         );
-        let a = n.take_outbound();
+        let a = n.ready();
         assert!(a.contains(&Action::Deliver(b"p".to_vec())));
         assert!(a.contains(&Action::Send(
             2,
@@ -507,9 +507,9 @@ mod tests {
             round: 0,
         };
         n.on_message(0, 2, m.clone());
-        let _ = n.take_outbound();
+        let _ = n.ready();
         n.on_message(0, 3, m); // same message again, from 3
-        assert_eq!(n.take_outbound(), vec![Action::Send(3, Message::Prune)]);
+        assert_eq!(n.ready(), vec![Action::Send(3, Message::Prune)]);
         assert!(!n.eager().any(|&p| p == 3)); // 3 moved to lazy
     }
 
@@ -518,22 +518,19 @@ mod tests {
         let mut n: Plumtree<u32> = Plumtree::new(1, [], [2], Config::default());
         n.on_message(0, 2, Message::Ihave(vec![(7, 0)]));
         n.tick(100); // before the timeout
-        assert!(n.take_outbound().is_empty());
+        assert!(n.ready().is_empty());
         n.tick(600); // after it
-        assert_eq!(
-            n.take_outbound(),
-            vec![Action::Send(2, Message::Graft((7, 0)))]
-        );
+        assert_eq!(n.ready(), vec![Action::Send(2, Message::Graft((7, 0)))]);
     }
 
     #[test]
     fn a_graft_is_answered_with_the_cached_payload() {
         let mut n: Plumtree<u32> = Plumtree::new(1, [2], [], Config::default());
         n.broadcast(0, b"p".to_vec()); // id (1,0) is now cached
-        let _ = n.take_outbound();
+        let _ = n.ready();
         n.on_message(0, 8, Message::Graft((1, 0)));
         assert_eq!(
-            n.take_outbound(),
+            n.ready(),
             vec![Action::Send(
                 8,
                 Message::Gossip {
@@ -553,7 +550,7 @@ mod tests {
         n.membership(&[], &[3, 4]); // 3 leaves
         assert!(!n.eager().any(|&p| p == 3));
         // The queued Send to the departed peer 3 is gone; the Send to 2 stays.
-        let a = n.take_outbound();
+        let a = n.ready();
         assert!(a.iter().all(|x| !matches!(x, Action::Send(3, _))));
         assert!(a.iter().any(|x| matches!(x, Action::Send(2, _))));
     }
@@ -563,7 +560,7 @@ mod tests {
         let mut n: Plumtree<u32> = Plumtree::new(1, [2, 3], [4], Config::default());
         n.down(&[2]); // peer 2 unreachable
         n.broadcast(0, b"x".to_vec());
-        let a = n.take_outbound();
+        let a = n.ready();
         // Nothing goes to the down peer 2; the other eager peer 3 still gets it.
         assert!(a.iter().all(|x| !matches!(x, Action::Send(2, _))));
         assert!(a.iter().any(|x| matches!(x, Action::Send(3, _))));
@@ -572,7 +569,7 @@ mod tests {
         n.up(&[2]); // reachable again -> lazy
         n.broadcast(0, b"y".to_vec());
         n.tick(1);
-        let a = n.take_outbound();
+        let a = n.ready();
         // 2 hears about messages again, now as a lazy peer (via IHAVE).
         assert!(a
             .iter()
@@ -592,7 +589,7 @@ mod tests {
                 round: 0,
             },
         );
-        let _ = n.take_outbound();
+        let _ = n.ready();
         assert!(n.eager().any(|&p| p == 2)); // grafted back in, no longer down
     }
 }
