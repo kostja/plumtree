@@ -1,0 +1,17 @@
+[package]
+name = "plumtree-fsm"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.63"
+license = "MIT OR Apache-2.0"
+description = "A pure Plumtree (epidemic broadcast tree) state machine: no IO, no clock, driven by events, returning actions. Modelled on the etcd/raft and Scylla Raft output-queue design."
+repository = "https://github.com/kostja/plumtree-fsm"
+homepage = "https://github.com/kostja/plumtree-fsm"
+documentation = "https://docs.rs/plumtree-fsm"
+readme = "README.md"
+keywords = ["plumtree", "gossip", "epidemic", "broadcast"]
+categories = ["network-programming", "algorithms"]
+authors = ["Konstantin Osipov <kostja.osipov@gmail.com>"]
+
+[dev-dependencies]
+proptest = "1"
