@@ -17,8 +17,6 @@ gossip-level resilience.
 | Getting actions out | `ready()` drains the whole FIFO queue at once (`etcd/raft` `Ready` style) | `poll_action()` returns one action at a time |
 | Clock | an internal tick counter you advance with `tick(n)` | an internal clock you advance with `tick(duration)` |
 | Membership vs liveness | separate: `membership(added, removed)` and `down`/`up` | one path: `handle_neighbor_up`/`down` |
-| Tests | multi-node convergence under message loss and cluster churn | multi-node convergence, no loss, no churn |
-| Maintenance | active | last release 2018 |
 
 There is an older crate, [`plumtree`][sile] (2018), built on the same idea; the right column notes
 where this one differs.
