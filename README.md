@@ -47,6 +47,12 @@ let mut node = Plumtree::new(me, eager, lazy, Config::default());
 
 The id type is generic (`Plumtree<Id>` for any `Ord + Clone`): a `u32` raft id, a uuid, anything.
 
+Keep the lazy set small and random, a handful of peers, not every member. A `GRAFT` goes to
+the lazy peer that announced the message first. If every node is lazy-linked to the source,
+that peer is the source itself, and after each lost message one more node hangs directly off
+it: the tree flattens, and the source ends up sending to everyone. The paper draws lazy peers
+from a small random view (HyParView) for this reason.
+
 ## Driving it: a worker
 
 Every input — `broadcast`, `on_message`, `tick`, `membership`, `down`, `up` — changes state and
