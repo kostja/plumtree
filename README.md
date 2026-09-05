@@ -47,78 +47,136 @@ let mut node = Plumtree::new(me, eager, lazy, Config::default());
 
 The id type is generic (`Plumtree<Id>` for any `Ord + Clone`): a `u32` raft id, a uuid, anything.
 
-## Driving it: a worker fiber
+## Driving it: a worker
 
 Every input — `broadcast`, `on_message`, `tick`, `membership`, `down`, `up` — changes state and
 appends to one FIFO queue. You drain it with `ready()` and run the actions in order. You do not
 have to drain between inputs; outputs of several inputs come out in call order.
 
-Here is a complete worker that pairs `plumtree-fsm` with a [`bcounter`](https://crates.io/crates/bcounter)
-counter and a network. `plumtree-fsm` carries opaque bytes; `bcounter` produces them. The worker
-is the only part that touches the network and the clock — the two libraries do neither. (The
-tested version of this is the `gossip-sim` crate in the `bcounter` repository.)
+Draining is edge-triggered. `broadcast`, `on_message` and `tick` return `true` only when they
+take the queue from empty to non-empty. Use that to wake a sender fiber; the input handlers
+themselves never drain. The sender must drain to empty each time — `ready()` does.
+
+Here is a complete worker that pairs `plumtree-fsm` with a
+[`bcounter`](https://crates.io/crates/bcounter) counter and a network. Two libraries, three
+parts: `plumtree-fsm` spreads bytes, `bcounter` produces them and enforces the quota, and the
+**lease root** — the Raft leader — refills each node's lease. The worker is the only part that
+touches the network and the clock. (The tested version is the `gossip-sim` crate in the
+`bcounter` repository.)
 
 ```rust,ignore
 use plumtree_fsm::{Plumtree, Message, Action, Config};
-use bcounter::BCounter;
+use bcounter::{BCounter, Denied, Quota};
 
-struct Worker {
+const LEASE_CHUNK: u64 = 1 << 20; // how much a node asks for at a time
+
+// Every node runs this. Two cooperative fibers share it: the input handlers below, and the
+// sender fiber at the end. (In a cooperative scheduler such as Picodata's, the two never run at
+// the same instant, so a shared handle to `Node` is enough.)
+struct Node {
     tree: Plumtree<NodeId>,
-    usage: BCounter<NodeId>,
-    net: ConnectionPool,   // your transport (msgpack over iproto, say)
+    usage: BCounter<NodeId>,   // this node's lease, and its view of everyone's usage
+    governor: NodeId,          // the lease root: the current Raft leader
+    net: ConnectionPool,
+    sender_wake: Notify,       // wakes the sender fiber
 }
 
-impl Worker {
-    // Run every queued action: send a message, or apply a delivered payload to the counter.
-    fn flush(&mut self) {
-        for action in self.tree.ready() {
-            match action {
-                Action::Send(peer, msg) => self.net.send(peer, encode_msg(&msg)),
-                Action::Deliver(bytes) => self.usage.apply(&decode_delta(&bytes)),
-            }
+impl Node {
+    // Forward the edge: if an input just made the queue non-empty, wake the sender.
+    fn wake_if(&self, edge: bool) {
+        if edge {
+            self.sender_wake.notify();
         }
     }
 
-    // A quota change happened locally (a write): record it and start spreading it.
-    fn on_local_write(&mut self, amount: u64) {
-        self.usage.acquire(amount).ok();
-        self.tree.broadcast(encode_delta(&self.usage.delta()));
-        self.flush();
+    // A write. Admit it against the local lease. If the lease is short, first ask the lease root
+    // for a chunk -- a direct request to the governor, not gossip. The governor answers 0 when
+    // the quota is exhausted, and then the write is denied.
+    async fn on_local_write(&mut self, amount: u64) -> Result<(), Denied> {
+        if self.usage.local_available() < amount {
+            let got = self.net.request_lease(self.governor, LEASE_CHUNK).await;
+            self.usage.grant(got);
+        }
+        self.usage.acquire(amount)?;
+        // Spread the new usage. Only this node's slot changed, but the delta is what we gossip.
+        let edge = self.tree.broadcast(encode_delta(&self.usage.delta()));
+        self.wake_if(edge);
+        Ok(())
     }
 
     // A plumtree message arrived from `peer`.
     fn on_network_message(&mut self, peer: NodeId, msg: Message<NodeId>) {
-        self.tree.on_message(peer, msg);
-        self.flush();
+        let edge = self.tree.on_message(peer, msg);
+        self.wake_if(edge);
     }
 
-    // The periodic timer fired (say every 100 ms). Advance the clock by one tick, and re-broadcast
-    // current state so a message lost earlier is covered by this one.
+    // The periodic timer fired (say every 100 ms). One tick, and a re-broadcast of the current
+    // state so that a message lost earlier is covered by this one.
     fn on_timer(&mut self) {
-        self.tree.tick(1);
-        self.tree.broadcast(encode_delta(&self.usage.delta()));
-        self.flush();
+        let e1 = self.tree.tick(1);
+        let e2 = self.tree.broadcast(encode_delta(&self.usage.delta()));
+        self.wake_if(e1 || e2);
     }
 
     // The cluster's membership record changed (from Raft): nodes joined or left for good.
+    // These only remove queued sends, so they never wake the sender.
     fn on_membership_change(&mut self, joined: &[NodeId], left: &[NodeId]) {
         self.tree.membership(joined, left);
-        self.flush();
     }
 
     // The failure detector's verdict changed: a member became unreachable, or reachable again.
     fn on_liveness_change(&mut self, down: &[NodeId], up: &[NodeId]) {
         self.tree.down(down);
         self.tree.up(up);
-        self.flush();
     }
 
-    // The Raft leader changed. Plumtree needs no action: the overlay is not rooted, so a leader
-    // change does not touch it. (If you run a rooted lease layer on top, that layer re-roots
-    // here; plumtree does not.)
-    fn on_leader_change(&mut self, _new_leader: NodeId) {}
+    // The Raft leader changed, so the lease root moved. Plumtree needs nothing: its overlay is
+    // not rooted. The lease layer re-roots by sending future requests to the new leader. Grants
+    // already held stay valid: the governor's ledger lives in Raft state, so the new leader
+    // inherits it and lends nothing twice.
+    fn on_leader_change(&mut self, new_leader: NodeId) {
+        self.governor = new_leader;
+    }
+
+    // The sender fiber. Woken on the edge; drains the queue to empty; runs every action. Sends
+    // yield on the network here without blocking the input handlers.
+    async fn sender(&mut self) {
+        loop {
+            self.sender_wake.wait().await;
+            for action in self.tree.ready() {
+                match action {
+                    Action::Send(peer, msg) => self.net.send(peer, encode_msg(&msg)).await,
+                    Action::Deliver(bytes) => self.usage.apply(&decode_delta(&bytes)),
+                }
+            }
+        }
+    }
+}
+
+// The lease root. Only the Raft leader runs this. It hands out leases from a `Quota` whose
+// ledger of outstanding grants is kept in Raft state -- that is what makes a leader change safe.
+struct Governor {
+    quota: RaftQuota, // implements bcounter::Quota; keeps  Σ grants ≤ limit (+ Δ)
+}
+
+impl Governor {
+    // A node ran short and asked for a chunk. Returns what was lent: at most `want`, and 0 when
+    // the quota is exhausted.
+    fn on_lease_request(&mut self, who: NodeId, want: u64) -> u64 {
+        self.quota.grant(&who, want)
+    }
+
+    // A node returned rights it will not use, so they can be lent to a busier node.
+    fn on_lease_return(&mut self, who: NodeId, unused: u64) {
+        self.quota.reclaim(&who, unused);
+    }
 }
 ```
+
+What refills the quota: a node draws a chunk from the governor when its lease runs short, and
+returns unused rights so the governor can move them elsewhere. A node never spends more than its
+lease, and the governor never lends more than the limit, so the cluster never exceeds the limit
+— without a round trip on the write path, except the occasional chunk request.
 
 ## Membership and liveness
 

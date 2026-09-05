@@ -25,14 +25,21 @@
 //! # The contract
 //!
 //! Every input — [`broadcast`](Plumtree::broadcast), [`on_message`](Plumtree::on_message),
-//! [`tick`](Plumtree::tick), [`membership`](Plumtree::membership) — mutates state and **appends
-//! to one FIFO outbound queue**. It returns nothing. You drain the queue with
-//! [`ready`](Plumtree::ready) and run the [`Action`]s in order.
+//! [`tick`](Plumtree::tick), [`membership`](Plumtree::membership), [`down`](Plumtree::down),
+//! [`up`](Plumtree::up) — mutates state and **appends to one FIFO outbound queue**. You drain
+//! the queue with [`ready`](Plumtree::ready) and run the [`Action`]s in order.
 //!
 //! You do **not** have to drain between inputs. Call several inputs, then drain once; their
 //! outputs concatenate in call order. No input reads the queue, so nothing depends on when you
 //! process it. That is the whole independence rule: inputs are order-independent of output
 //! handling, and outputs are run in FIFO order.
+//!
+//! Draining is **edge-triggered**. The three inputs that can produce output — `broadcast`,
+//! `on_message`, `tick` — return `true` only when they took the queue from empty to non-empty.
+//! That is the moment to wake whoever drains. A pure state machine cannot call you; it hands
+//! you the edge instead, and you turn it into a wake-up for a sender fiber. `membership`,
+//! `down` and `up` only ever remove queued sends, so they cannot wake anyone. The one rule an
+//! edge-triggered wake imposes: the drainer must always drain to empty — which `ready` does.
 //!
 //! An [`Action`] is either `Send(peer, message)` — serialize and send it — or `Deliver(payload)`
 //! — hand it to the application. Pair this with `bcounter`: on `Deliver`, decode the bytes and
@@ -206,6 +213,19 @@ impl<Id: Ord + Clone> Plumtree<Id> {
         std::mem::take(&mut self.outbound)
     }
 
+    /// True while the outbound queue holds actions. A level check; the inputs that can produce
+    /// output (`broadcast`, `on_message`, `tick`) also return the *edge* -- see the crate docs.
+    #[must_use]
+    pub fn has_ready(&self) -> bool {
+        !self.outbound.is_empty()
+    }
+
+    /// The edge: did this input take the queue from empty to non-empty? That is the moment to
+    /// wake whoever drains `ready()`.
+    fn woke(&self, was_empty: bool) -> bool {
+        was_empty && !self.outbound.is_empty()
+    }
+
     /// This node's current eager peers (its tree links). For tests and inspection.
     pub fn eager(&self) -> impl Iterator<Item = &Id> {
         self.eager.iter()
@@ -225,11 +245,13 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     /// Start spreading `payload`. Pushes a full message to each eager peer; lazy peers are told
     /// at the next [`tick`](Plumtree::tick). `now` seeds nothing here but keeps the input API
     /// uniform.
-    pub fn broadcast(&mut self, payload: Vec<u8>) {
+    pub fn broadcast(&mut self, payload: Vec<u8>) -> bool {
+        let was_empty = self.outbound.is_empty();
         let id = (self.me.clone(), self.seq);
         self.seq += 1;
         self.remember(id.clone(), payload.clone());
         self.spread(&id, &payload, 0, None);
+        self.woke(was_empty)
     }
 
     /// Push `id`/`payload` to every eager peer except `except`, and queue an `Ihave` for the
@@ -257,13 +279,15 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     }
 
     /// Handle a message from `from`.
-    pub fn on_message(&mut self, from: Id, msg: Message<Id>) {
+    pub fn on_message(&mut self, from: Id, msg: Message<Id>) -> bool {
+        let was_empty = self.outbound.is_empty();
         match msg {
             Message::Gossip { id, payload, round } => self.on_gossip(from, id, payload, round),
             Message::Ihave(ids) => self.on_ihave(from, ids),
             Message::Graft(id) => self.on_graft(from, id),
             Message::Prune => self.move_to_lazy(&from),
         }
+        self.woke(was_empty)
     }
 
     fn on_gossip(&mut self, from: Id, id: MsgId<Id>, payload: Vec<u8>, round: u16) {
@@ -343,7 +367,8 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     /// deadline (trying the next announcer, and re-arming). Call it on a timer -- once per timer
     /// fire, or with a larger `ticks` to fast-forward. This is the only input that moves time; a
     /// tick is whatever unit you choose, and [`Config::graft_timeout`] counts in the same unit.
-    pub fn tick(&mut self, ticks: u64) {
+    pub fn tick(&mut self, ticks: u64) -> bool {
+        let was_empty = self.outbound.is_empty();
         self.now = self.now.saturating_add(ticks);
         let now = self.now;
         // Announce everything heard since the last tick to every lazy peer.
@@ -373,6 +398,7 @@ impl<Id: Ord + Clone> Plumtree<Id> {
                 self.missing.remove(&id);
             }
         }
+        self.woke(was_empty)
     }
 
     /// Change the cluster's membership: `added` nodes have joined, `removed` nodes have left for
@@ -479,6 +505,20 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn inputs_report_the_empty_to_non_empty_edge() {
+        let mut n: Plumtree<u32> = Plumtree::new(1, [2], [], Config::default());
+        // The first broadcast takes the queue from empty to non-empty: an edge, wake the sender.
+        assert!(n.broadcast(b"a".to_vec()));
+        // A second lands on a non-empty queue: no edge -- the drainer will get both anyway.
+        assert!(!n.broadcast(b"b".to_vec()));
+        assert!(n.has_ready());
+        let _ = n.ready();
+        assert!(!n.has_ready());
+        // Once drained, the next output is an edge again.
+        assert!(n.broadcast(b"c".to_vec()));
     }
 
     #[test]
