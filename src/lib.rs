@@ -445,7 +445,9 @@ impl<Id: Ord + Clone> Plumtree<Id> {
 
     /// The optimisation step of the paper: `lazy` heard the message at hop `lazy_round`, our
     /// eager copy from `via` arrived at hop `round`. If the gap clears the threshold, adjusted
-    /// for cost, make `lazy` eager and `via` lazy. Returns whether it did.
+    /// for cost, make `lazy` eager and `via` lazy. Cost is hops' worth: a peer cheaper by 10
+    /// is taken even 8 hops farther out, and a peer costlier by 10 needs 12 hops of gain.
+    /// Returns whether it did.
     fn try_swap(&mut self, via: &Id, round: u16, lazy: &Id, lazy_round: u16) -> bool {
         if lazy == via || !self.lazy.contains(lazy) || !self.eager.contains(via) {
             return false;
@@ -453,7 +455,7 @@ impl<Id: Ord + Clone> Plumtree<Id> {
         let bar = i32::from(self.cfg.swap_threshold) + i32::from(self.cost_of(lazy))
             - i32::from(self.cost_of(via));
         let gain = i32::from(round) - i32::from(lazy_round);
-        if gain < bar.max(1) {
+        if gain < bar {
             return false;
         }
         self.graft_in(lazy);
@@ -930,6 +932,27 @@ mod tests {
         );
         assert!(n.eager().any(|&p| p == 3));
         assert!(n.lazy().any(|&p| p == 2));
+    }
+
+    #[test]
+    fn a_cheaper_announcer_is_taken_even_on_a_longer_path() {
+        // The eager copy came over a slow link (cost 10) at hop 1; a local lazy peer (cost 0)
+        // announces it at hop 6. Five hops farther, ten hops cheaper: swap.
+        let mut n: Plumtree<u32> = Plumtree::new(1, [(2, 10), (3, 0)], Config::default());
+        n.on_message(3, Message::Prune);
+        n.on_message(
+            2,
+            Message::Gossip {
+                id: (9, 0),
+                payload: b"m".to_vec(),
+                round: 1,
+            },
+        );
+        let _ = n.ready();
+        n.on_message(3, Message::Ihave(vec![((9, 0), 6)]));
+        let a = n.ready();
+        assert!(a.contains(&Action::Send(3, Message::Graft(None))));
+        assert!(a.contains(&Action::Send(2, Message::Prune)));
     }
 
     #[test]

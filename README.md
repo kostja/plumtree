@@ -61,7 +61,7 @@ source itself. The paper draws lazy peers from a small random view (HyParView) f
 Cost shapes the tree in four places: the starting eager set; which announcer is grafted first
 (the cheapest); which of two eager links a duplicate prunes (the costlier, and between equals
 the late one); and the swap, where a costlier peer needs that many more hops of gain to replace
-an eager link. So a cross-domain link survives only where no local path exists, and a domain is
+an eager link, and a cheaper one is taken even that many hops farther out. So a cross-domain link survives only where no local path exists, and a domain is
 normally reached through one entry point.
 
 `Plumtree::with_split(me, eager, lazy, config)` takes an explicit split instead, all at cost 0,
