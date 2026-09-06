@@ -17,6 +17,7 @@ gossip-level resilience.
 | Getting actions out | `ready()` drains the whole FIFO queue at once (`etcd/raft` `Ready` style) | `poll_action()` returns one action at a time |
 | Clock | an internal tick counter you advance with `tick(n)` | an internal clock you advance with `tick(duration)` |
 | Membership vs liveness | separate: `membership(added, removed)` and `down`/`up` | one path: `handle_neighbor_up`/`down` |
+| Tree tuning | the paper's swap on hop count, weighted by a per-peer cost (failure domain) | none |
 
 There is an older crate, [`plumtree`][sile] (2018), built on the same idea; the right column notes
 where this one differs.
@@ -29,29 +30,42 @@ pulls that peer into its eager set. A node that receives the same message twice 
 duplicate link with a `PRUNE`. The eager links settle into a tree in a round or two; the lazy
 links stay ready to repair it.
 
+The tree also tunes itself to the sender. Every message carries its hop count, and so does
+every `IHAVE`. A node that hears of a message from a lazy peer several hops earlier than its
+eager copy arrived swaps the two links: that lazy peer is closer to the source. After a few
+messages from a new source the tree is balanced around it again. A Raft leader change, for
+example, costs the leader's next few messages, not a rebuild.
+
 ## Constructing a node
 
 ```rust
 use plumtree_fsm::{Plumtree, Config};
 
-// Plumtree::new(me, eager, lazy, config):
+// Plumtree::new(me, peers, config):
 //   me     -- this node's id
-//   eager  -- the peers that start on the tree (get full messages)
-//   lazy   -- the other peers (get only message ids, and repair the tree)
-//   config -- tuning (GRAFT timeout, message-cache size)
+//   peers  -- every other member, each with a cost: 0 for the same failure domain,
+//             1 (or more) for another. Pass them shuffled; order breaks ties.
+//   config -- tuning: fanout, swap threshold, GRAFT timeout, message-cache size
 let me = 1u32;
-let eager = [2, 3];   // a small set; a common choice is ceil(log2 N)+1 random peers
-let lazy = [4, 5, 6]; // the rest of the members
-let mut node = Plumtree::new(me, eager, lazy, Config::default());
+let peers = [(2, 0), (3, 0), (4, 0), (5, 0), (6, 1), (7, 1)];
+let mut node = Plumtree::new(me, peers, Config::default());
 ```
 
-The id type is generic (`Plumtree<Id>` for any `Ord + Clone`): a `u32` raft id, a uuid, anything.
+The crate picks the eager set: `fanout` peers of cost 0, plus one peer of each other cost, so
+every other domain is entered once and the message spreads inside it. The rest start lazy.
+Keep the lazy set to a handful of random peers per domain, not every member: a `GRAFT` goes to
+the announcer that spoke first, and if every node is lazy-linked to the source that is the
+source itself. The paper draws lazy peers from a small random view (HyParView) for this reason.
 
-Keep the lazy set small and random, a handful of peers, not every member. A `GRAFT` goes to
-the lazy peer that announced the message first. If every node is lazy-linked to the source,
-that peer is the source itself, and after each lost message one more node hangs directly off
-it: the tree flattens, and the source ends up sending to everyone. The paper draws lazy peers
-from a small random view (HyParView) for this reason.
+Cost shapes the tree in three places: the starting eager set, which announcer is grafted first
+(the cheapest), and the swap: a costlier peer needs a bigger hop gain to replace an eager link,
+a cheaper one a smaller gain. So a cross-domain link is kept only when it saves real hops, and
+a domain is normally reached through one entry point.
+
+`Plumtree::with_split(me, eager, lazy, config)` takes an explicit split instead, all at cost 0,
+for tests and for callers that build the overlay themselves.
+
+The id type is generic (`Plumtree<Id>` for any `Ord + Clone`): a `u32` raft id, a uuid, anything.
 
 ## Driving it: a worker
 
@@ -71,7 +85,7 @@ touches the network and the clock. (The tested version is the `gossip-sim` crate
 `bcounter` repository.)
 
 ```rust,ignore
-use plumtree_fsm::{Plumtree, Message, Action, Config};
+use plumtree_fsm::{Plumtree, Message, Action, Config, Cost};
 use bcounter::{BCounter, Denied, Quota};
 
 const LEASE_CHUNK: u64 = 1 << 20; // how much a node asks for at a time
@@ -126,7 +140,7 @@ impl Node {
 
     // The cluster's membership record changed (from Raft): nodes joined or left for good.
     // These only remove queued sends, so they never wake the sender.
-    fn on_membership_change(&mut self, joined: &[NodeId], left: &[NodeId]) {
+    fn on_membership_change(&mut self, joined: &[(NodeId, Cost)], left: &[NodeId]) {
         self.tree.membership(joined, left);
     }
 
@@ -188,8 +202,8 @@ lease, and the governor never lends more than the limit, so the cluster never ex
 
 These are two different events, so they are two calls.
 
-- `membership(added, removed)` — a node joined the cluster, or left for good. A joined node
-  starts lazy. A left node is forgotten. Drive this from the cluster's membership record.
+- `membership(added, removed)` — a node joined the cluster (with its cost), or left for good. A
+  joined node starts lazy. A left node is forgotten. Drive this from the cluster's membership record.
 - `down(peers)` / `up(peers)` — a member became unreachable, or reachable again. A down node is
   kept but set aside, so the tree routes around it. `up` (or any message from it) brings it back.
   Drive this from a failure detector.
