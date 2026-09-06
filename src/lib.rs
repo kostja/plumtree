@@ -159,8 +159,9 @@ pub enum Action<Id> {
 /// Tuning. Times are in whatever unit the caller's clock uses (milliseconds, say).
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
-    /// How long to wait after hearing an `Ihave` before sending a `Graft` for it. Must exceed
-    /// the time a message takes to cross the tree, or lazy peers graft onto the source itself.
+    /// How long to wait after hearing an `Ihave` before sending a `Graft` for it, plus the
+    /// announcer's cost. Must exceed the time a message takes to cross the tree, or lazy peers
+    /// graft onto the source itself.
     pub graft_timeout: u64,
     /// The largest number of payloads to keep for serving `Graft`s. Oldest are dropped.
     pub cache_cap: usize,
@@ -169,7 +170,7 @@ pub struct Config {
     pub fanout: usize,
     /// Swap an eager link for a lazy one when the lazy peer heard the message this many hops
     /// earlier. Each unit of extra cost on the lazy peer raises the bar by one; each unit less
-    /// lowers it, never below one hop.
+    /// lowers it, so a much cheaper peer is taken even on a longer path.
     pub swap_threshold: u16,
 }
 
