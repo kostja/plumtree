@@ -96,6 +96,7 @@
 //! // default fanout of 3, peers 2, 3, 4 and 6 start eager and 5 starts lazy.
 //! let peers = [(2, 0), (3, 0), (4, 0), (5, 0), (6, 1)];
 //! let mut n: Plumtree<u32> = Plumtree::new(1, peers, Config::default());
+//! let _ = n.ready(); // the introductions to its peers
 //! n.broadcast(b"hello".to_vec());
 //! let actions = n.ready();
 //! // A full push to each eager peer.
