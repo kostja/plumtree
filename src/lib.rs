@@ -185,11 +185,10 @@ impl Default for Config {
 
 /// A message a node has heard of (via `Ihave`) but does not yet have.
 struct Missing<Id> {
-    /// Peers that announced it, with the hop count each got it at; cheapest first, tried in
-    /// turn.
-    announcers: VecDeque<(Id, u16)>,
-    /// When to send the next `Graft`.
-    deadline: u64,
+    /// Peers that announced it, with the hop count each got it at and the tick from which it
+    /// may be asked; cheapest first, tried in turn. A costly announcer waits its cost longer:
+    /// the cheap path may still deliver.
+    announcers: VecDeque<(Id, u16, u64)>,
 }
 
 /// A message this node has.
@@ -411,7 +410,7 @@ impl<Id: Ord + Clone> Plumtree<Id> {
         self.spread(&id, &payload, round.saturating_add(1), Some(&from));
         // A lazy peer announced it much earlier: it is closer to the source. Swap links.
         if let Some(m) = heard {
-            for (q, r) in m.announcers {
+            for (q, r, _) in m.announcers {
                 if self.try_swap(&from, round, &q, r) {
                     break;
                 }
@@ -429,17 +428,17 @@ impl<Id: Ord + Clone> Plumtree<Id> {
                 continue;
             }
             let cost = self.cost_of(&from);
+            let ready = self.now + self.cfg.graft_timeout + u64::from(cost);
             let entry = self.missing.entry(id).or_insert_with(|| Missing {
                 announcers: VecDeque::new(),
-                deadline: self.now + self.cfg.graft_timeout,
             });
             // Cheapest announcer first.
             let pos = entry
                 .announcers
                 .iter()
-                .position(|(a, _)| self.cost.get(a).copied().unwrap_or(0) > cost)
+                .position(|(a, _, _)| self.cost.get(a).copied().unwrap_or(0) > cost)
                 .unwrap_or(entry.announcers.len());
-            entry.announcers.insert(pos, (from.clone(), r));
+            entry.announcers.insert(pos, (from.clone(), r, ready));
         }
     }
 
@@ -497,7 +496,7 @@ impl<Id: Ord + Clone> Plumtree<Id> {
             self.eager.remove(p);
             self.lazy.remove(p);
             for m in self.missing.values_mut() {
-                m.announcers.retain(|(a, _)| a != p);
+                m.announcers.retain(|(a, _, _)| a != p);
             }
         }
         self.outbound.retain(|a| match a {
@@ -535,23 +534,25 @@ impl<Id: Ord + Clone> Plumtree<Id> {
         }
         self.lazy_announce.clear();
 
-        // Graft anything still missing.
-        let due: Vec<MsgId<Id>> = self
-            .missing
-            .iter()
-            .filter(|(_, m)| m.deadline <= now)
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in due {
+        // Graft anything still missing from the first announcer whose time has come; give up
+        // on a message nobody is left to ask for -- a later broadcast will heal it.
+        let ids: Vec<MsgId<Id>> = self.missing.keys().cloned().collect();
+        let timeout = self.cfg.graft_timeout;
+        for id in ids {
             let m = self.missing.get_mut(&id).expect("id came from missing");
-            if let Some((next, _)) = m.announcers.pop_front() {
-                m.deadline = now + self.cfg.graft_timeout;
-                self.outbound
-                    .push(Action::Send(next, Message::Graft(Some(id))));
-            } else {
-                // No one left to ask. Give up; a later state broadcast will heal it.
-                self.missing.remove(&id);
+            let Some(pos) = m.announcers.iter().position(|(_, _, t)| *t <= now) else {
+                if m.announcers.is_empty() {
+                    self.missing.remove(&id);
+                }
+                continue;
+            };
+            let (next, _, _) = m.announcers.remove(pos).expect("position found");
+            // Whoever is left waits a full timeout more before being asked.
+            for a in m.announcers.iter_mut() {
+                a.2 = a.2.max(now + timeout);
             }
+            self.outbound
+                .push(Action::Send(next, Message::Graft(Some(id))));
         }
         self.woke(was_empty)
     }
@@ -953,6 +954,29 @@ mod tests {
         let a = n.ready();
         assert!(a.contains(&Action::Send(3, Message::Graft(None))));
         assert!(a.contains(&Action::Send(2, Message::Prune)));
+    }
+
+    #[test]
+    fn a_costly_announcer_is_asked_its_cost_later() {
+        // 2 announces over a cost-10 link; 3 (local) has not announced yet. The graft to 2
+        // waits graft_timeout + 10, so a local copy has time to arrive.
+        let cfg = Config {
+            graft_timeout: 5,
+            ..Config::default()
+        };
+        let mut n: Plumtree<u32> = Plumtree::new(1, [(2, 10), (3, 0)], cfg);
+        n.on_message(2, Message::Prune);
+        n.on_message(3, Message::Prune);
+        n.on_message(2, Message::Ihave(vec![((9, 0), 0)]));
+        n.tick(14);
+        assert!(n.ready().is_empty(), "not yet");
+        n.on_message(3, Message::Ihave(vec![((9, 0), 3)]));
+        n.tick(1);
+        // 3's own wait is 5 from its announcement; 2's has run out. 2 goes first here.
+        assert_eq!(
+            n.ready(),
+            vec![Action::Send(2, Message::Graft(Some((9, 0))))]
+        );
     }
 
     #[test]
