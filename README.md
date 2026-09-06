@@ -53,10 +53,17 @@ let mut node = Plumtree::new(me, peers, Config::default());
 ```
 
 The crate picks the eager set: `fanout` peers of cost 0, plus one peer of each other cost, so
-every other domain is entered once and the message spreads inside it. The rest start lazy.
-Keep the lazy set to a handful of random peers per domain, not every member: a `GRAFT` goes to
-the announcer that spoke first, and if every node is lazy-linked to the source that is the
-source itself. The paper draws lazy peers from a small random view (HyParView) for this reason.
+every other domain is entered once and the message spreads inside it. The rest start lazy. The
+node then introduces itself to each peer (a bare `GRAFT` to an eager one, an empty `IHAVE` to a
+lazy one), so every link is the same from both ends; the first `ready()` carries those.
+
+Two things to get right in the peer list. Keep the lazy set to a handful of random peers per
+domain, not every member: a `GRAFT` goes to the announcer that spoke first, and if every node
+is lazy-linked to the source that is the source itself. And give cross-domain peers only to a
+few *gateway* nodes per domain, chosen the same way on every node (the lowest ids, say): the
+cost rules choose well among the links that exist, but with a cross-domain link at every node
+a random overlay keeps many of them. With two gateways per domain the tree crosses a domain
+boundary at most twice, whatever else happens.
 
 Cost shapes the tree in four places: the starting eager set; which announcer is grafted first
 (the cheapest); which of two eager links a duplicate prunes (the costlier, and between equals
@@ -205,7 +212,8 @@ lease, and the governor never lends more than the limit, so the cluster never ex
 These are two different events, so they are two calls.
 
 - `membership(added, removed)` — a node joined the cluster (with its cost), or left for good. A
-  joined node starts lazy. A left node is forgotten. Drive this from the cluster's membership record.
+  joined node is only known here; it becomes a peer when it introduces itself, which a new node
+  does to the peers it was constructed with. A left node is forgotten. Drive this from the cluster's membership record.
 - `down(peers)` / `up(peers)` — a member became unreachable, or reachable again. A down node is
   kept but set aside, so the tree routes around it. `up` (or any message from it) brings it back.
   Drive this from a failure detector.
