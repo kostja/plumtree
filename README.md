@@ -148,7 +148,7 @@ impl Node {
     }
 
     // A write. Admit it against the local lease. If the lease is short, first ask the lease root
-    // for a chunk -- a direct request to the governor, not gossip. The governor answers 0 when
+    // for a chunk -- a direct request to the leader, not gossip. The leader answers 0 when
     // the quota is exhausted, and then the write is denied.
     async fn on_local_write(&mut self, amount: u64) -> Result<(), Denied> {
         if self.usage.local_available() < amount {
@@ -232,9 +232,9 @@ impl Governor {
 }
 ```
 
-What refills the quota: a node draws a chunk from the governor when its lease runs short, and
-returns unused rights so the governor can move them elsewhere. A node never spends more than its
-lease, and the governor never lends more than the limit, so the cluster never exceeds the limit
+What refills the quota: a node draws a chunk from the leader when its lease runs short, and
+returns unused rights so the leader can move them elsewhere. A node never spends more than its
+lease, and the leader never lends more than the limit, so the cluster never exceeds the limit
 — without a round trip on the write path, except the occasional chunk request.
 
 ## Membership and liveness
