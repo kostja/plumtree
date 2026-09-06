@@ -255,7 +255,21 @@ impl<Id: Ord + Clone> Plumtree<Id> {
         }
         let mut node = Self::with_split(me, eager, lazy, cfg);
         node.cost = peers.into_iter().collect();
+        node.introduce();
         node
+    }
+
+    /// Tell each chosen peer about us, so links are the same from both ends: a bare `Graft`
+    /// to an eager peer, an empty `Ihave` to a lazy one. A node that hears from a stranger
+    /// takes it as a lazy peer.
+    fn introduce(&mut self) {
+        for p in self.eager.clone() {
+            self.outbound.push(Action::Send(p, Message::Graft(None)));
+        }
+        for p in self.lazy.clone() {
+            self.outbound
+                .push(Action::Send(p, Message::Ihave(Vec::new())));
+        }
     }
 
     /// A new node with an explicit split of peers into eager and lazy, all at cost 0. For
@@ -370,6 +384,11 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     /// Handle a message from `from`.
     pub fn on_message(&mut self, from: Id, msg: Message<Id>) -> bool {
         let was_empty = self.outbound.is_empty();
+        let known =
+            self.eager.contains(&from) || self.lazy.contains(&from) || self.down.contains(&from);
+        if !known && from != self.me {
+            self.lazy.insert(from.clone());
+        }
         match msg {
             Message::Gossip { id, payload, round } => self.on_gossip(from, id, payload, round),
             Message::Ihave(ids) => self.on_ihave(from, ids),
@@ -448,7 +467,7 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     /// is taken even 8 hops farther out, and a peer costlier by 10 needs 12 hops of gain.
     /// Returns whether it did.
     fn try_swap(&mut self, via: &Id, round: u16, lazy: &Id, lazy_round: u16) -> bool {
-        if lazy == via || !self.lazy.contains(lazy) || !self.eager.contains(via) {
+        if lazy == via || self.eager.contains(lazy) || !self.eager.contains(via) {
             return false;
         }
         let bar = i32::from(self.cfg.swap_threshold) + i32::from(self.cost_of(lazy))
@@ -558,19 +577,15 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     }
 
     /// Change the cluster's membership: `added` nodes have joined, each with its cost, and
-    /// `removed` nodes have left for good. A joined node starts lazy and is grafted into the
-    /// tree by the first message it exchanges. A removed node is **forgotten entirely** --
-    /// dropped from every set and from any pending recovery, and any queued `Send` to it is
-    /// removed.
+    /// `removed` nodes have left for good. A joined node is only *known* here (its cost is
+    /// recorded); it becomes a peer when it introduces itself, which a new node does to the
+    /// peers it was constructed with. A removed node is **forgotten entirely** -- dropped
+    /// from every set and from any pending recovery, and any queued `Send` to it is removed.
     ///
     /// This is not the same as [`down`](Plumtree::down)/[`up`](Plumtree::up): removal expels a
     /// node, while down only sets it aside while it is unreachable.
     pub fn membership(&mut self, added: &[(Id, Cost)], removed: &[Id]) {
         for (p, c) in added {
-            let known = self.eager.contains(p) || self.lazy.contains(p) || self.down.contains(p);
-            if *p != self.me && !known {
-                self.lazy.insert(p.clone());
-            }
             if *p != self.me {
                 self.cost.insert(p.clone(), *c);
             }
@@ -806,19 +821,25 @@ mod tests {
     // ---------------------------------------------------------------- cost and optimisation
 
     #[test]
-    fn new_picks_eager_peers_by_cost() {
+    fn new_picks_eager_peers_by_cost_and_introduces_itself() {
         let cfg = Config {
             fanout: 2,
             ..Config::default()
         };
-        let n: Plumtree<u32> = Plumtree::new(
-            1,
-            [(2, 0), (3, 0), (4, 0), (5, 0), (6, 1), (7, 1), (8, 2)],
-            cfg,
-        );
+        let peers = [(2, 0), (3, 0), (4, 0), (5, 0), (6, 1), (7, 1), (8, 2)];
+        let mut n: Plumtree<u32> = Plumtree::new(1, peers, cfg);
         // Two of the cheapest, then one per other cost.
         assert_eq!(n.eager().copied().collect::<Vec<_>>(), vec![2, 3, 6, 8]);
         assert_eq!(n.lazy().copied().collect::<Vec<_>>(), vec![4, 5, 7]);
+        let a = n.ready();
+        assert!(a.contains(&Action::Send(2, Message::Graft(None))));
+        assert!(a.contains(&Action::Send(4, Message::Ihave(vec![]))));
+        // The other end takes a stranger as lazy, and a bare graft as eager.
+        let mut m: Plumtree<u32> = Plumtree::with_split(4, [], [], Config::default());
+        m.on_message(1, Message::Ihave(vec![]));
+        assert!(m.lazy().any(|&p| p == 1));
+        m.on_message(1, Message::Graft(None));
+        assert!(m.eager().any(|&p| p == 1));
     }
 
     #[test]
@@ -965,6 +986,7 @@ mod tests {
             ..Config::default()
         };
         let mut n: Plumtree<u32> = Plumtree::new(1, [(2, 10), (3, 0)], cfg);
+        let _ = n.ready(); // the introductions
         n.on_message(2, Message::Prune);
         n.on_message(3, Message::Prune);
         n.on_message(2, Message::Ihave(vec![((9, 0), 0)]));
