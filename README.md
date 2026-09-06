@@ -43,8 +43,9 @@ use plumtree_fsm::{Plumtree, Config};
 
 // Plumtree::new(me, peers, config):
 //   me     -- this node's id
-//   peers  -- every other member, each with a cost: 0 for the same failure domain,
-//             1 (or more) for another. Pass them shuffled; order breaks ties.
+//   peers  -- the members this node talks to, each with a cost: 0 for the same failure
+//             domain, about the latency ratio (10, say) for another. Shuffled; order
+//             breaks ties.
 //   config -- tuning: fanout, swap threshold, GRAFT timeout, message-cache size
 let me = 1u32;
 let peers = [(2, 0), (3, 0), (4, 0), (5, 0), (6, 1), (7, 1)];
@@ -57,10 +58,11 @@ Keep the lazy set to a handful of random peers per domain, not every member: a `
 the announcer that spoke first, and if every node is lazy-linked to the source that is the
 source itself. The paper draws lazy peers from a small random view (HyParView) for this reason.
 
-Cost shapes the tree in three places: the starting eager set, which announcer is grafted first
-(the cheapest), and the swap: a costlier peer needs a bigger hop gain to replace an eager link,
-a cheaper one a smaller gain. So a cross-domain link is kept only when it saves real hops, and
-a domain is normally reached through one entry point.
+Cost shapes the tree in four places: the starting eager set; which announcer is grafted first
+(the cheapest); which of two eager links a duplicate prunes (the costlier, and between equals
+the late one); and the swap, where a costlier peer needs that many more hops of gain to replace
+an eager link. So a cross-domain link survives only where no local path exists, and a domain is
+normally reached through one entry point.
 
 `Plumtree::with_split(me, eager, lazy, config)` takes an explicit split instead, all at cost 0,
 for tests and for callers that build the overlay themselves.

@@ -113,9 +113,10 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 /// across the cluster without coordination, because a node never reuses its own sequence.
 pub type MsgId<Id> = (Id, u64);
 
-/// How expensive a peer is to talk to, as the caller sees it. `0` is the cheapest: the same
-/// failure domain, say. The crate prefers cheaper peers on the tree and needs a larger gain to
-/// swap a link for a costlier one. The scale is the caller's; only differences matter.
+/// How expensive a peer is to talk to, in hops' worth of latency: `0` for the same failure
+/// domain, and for another domain about the ratio of the latencies (10, say, for a link ten
+/// times slower). A cheaper link always wins a duplicate; a costlier one needs that many
+/// more hops of gain to be swapped in.
 pub type Cost = u8;
 
 /// A message between nodes. The caller serializes and sends it; on receipt it feeds it back in
@@ -380,10 +381,26 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     }
 
     fn on_gossip(&mut self, from: Id, id: MsgId<Id>, payload: Vec<u8>, round: u16) {
-        if self.cache.contains_key(&id) {
-            // A duplicate: this eager link is redundant. Prune it.
-            self.move_to_lazy(&from);
-            self.outbound.push(Action::Send(from, Message::Prune));
+        if let Some(c) = self.cache.get(&id) {
+            // A duplicate: one of the two eager links is redundant. Drop the costlier one, and
+            // between equals the one that was late.
+            let via = c.from.clone();
+            let cheaper = via
+                .as_ref()
+                .is_some_and(|v| self.cost_of(&from) < self.cost_of(v) && self.eager.contains(v));
+            if cheaper {
+                let v = via.expect("checked");
+                if let Some(c) = self.cache.get_mut(&id) {
+                    c.from = Some(from.clone());
+                    c.round = round;
+                }
+                self.graft_in(&from);
+                self.move_to_lazy(&v);
+                self.outbound.push(Action::Send(v, Message::Prune));
+            } else {
+                self.move_to_lazy(&from);
+                self.outbound.push(Action::Send(from, Message::Prune));
+            }
             return;
         }
         // New. Cache it, stop waiting for it, deliver it, and pass it on.
@@ -891,6 +908,28 @@ mod tests {
             a.contains(&Action::Send(3, Message::Graft(None))),
             "gap 3 swaps"
         );
+    }
+
+    #[test]
+    fn a_duplicate_over_a_cheaper_link_prunes_the_costly_one_instead() {
+        // 2 is across a slow link (cost 10), 3 is local. The copy from 2 arrives first.
+        let mut n: Plumtree<u32> = Plumtree::new(1, [(2, 10), (3, 0)], Config::default());
+        let m = |id| Message::Gossip {
+            id,
+            payload: b"m".to_vec(),
+            round: 1,
+        };
+        n.on_message(2, m((9, 0)));
+        let _ = n.ready();
+        n.on_message(3, m((9, 0)));
+        let a = n.ready();
+        assert_eq!(
+            a,
+            vec![Action::Send(2, Message::Prune)],
+            "the slow link goes"
+        );
+        assert!(n.eager().any(|&p| p == 3));
+        assert!(n.lazy().any(|&p| p == 2));
     }
 
     #[test]
