@@ -1087,4 +1087,207 @@ mod tests {
             "after a few messages node 1 is within 2 hops: {last:?}"
         );
     }
+
+    // ---------------------------------------------------------------- shape
+
+    /// A deterministic cluster over failure domains: latency 1 within a domain, `cross`
+    /// across, no loss. Peers are what a caller would give: every node knows a few random
+    /// peers in its own domain; the lowest `gateways` ids of each domain also know the
+    /// lowest id of every other domain, at cost `cross`.
+    struct Cluster {
+        nodes: Vec<Plumtree<u32>>,
+        dc: Vec<u8>,
+        cross: u64,
+        now: u64,
+        pending: Vec<(u64, u32, u32, Message<u32>)>,
+        /// For the latest message: who delivered it to each node, and at what hop.
+        deliverer: Vec<Option<u32>>,
+        round: Vec<Option<u16>>,
+    }
+
+    impl Cluster {
+        fn new(n: u32, dcs: u8, fanout: usize, lazy: usize, gateways: u32, cross: u64) -> Self {
+            let dc_of = |id: u32| (id % u32::from(dcs)) as u8;
+            let mut seed = 0x5EEDu64;
+            let mut rnd = move |m: usize| -> usize {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) % m as u64) as usize
+            };
+            let mut nodes = Vec::new();
+            for id in 0..n {
+                let mine: Vec<u32> = (0..n)
+                    .filter(|&q| q != id && dc_of(q) == dc_of(id))
+                    .collect();
+                let mut peers: Vec<(u32, Cost)> = Vec::new();
+                let mut pool = mine.clone();
+                while peers.len() < (fanout + lazy).min(mine.len()) {
+                    let k = rnd(pool.len());
+                    peers.push((pool.remove(k), 0));
+                }
+                if id / u32::from(dcs) < gateways {
+                    for d in 0..dcs {
+                        if d != dc_of(id) {
+                            let entry = (0..n).find(|&q| dc_of(q) == d).unwrap();
+                            peers.push((entry, cross as Cost));
+                        }
+                    }
+                }
+                let cfg = Config {
+                    graft_timeout: 8,
+                    fanout,
+                    ..Config::default()
+                };
+                nodes.push(Plumtree::new(id, peers, cfg));
+            }
+            let mut c = Cluster {
+                nodes,
+                dc: (0..n).map(dc_of).collect(),
+                cross,
+                now: 0,
+                pending: Vec::new(),
+                deliverer: vec![None; n as usize],
+                round: vec![None; n as usize],
+            };
+            c.flush();
+            c.settle();
+            c
+        }
+
+        fn flush(&mut self) {
+            for i in 0..self.nodes.len() {
+                for a in self.nodes[i].ready() {
+                    if let Action::Send(to, m) = a {
+                        let lat = if self.dc[i] == self.dc[to as usize] {
+                            1
+                        } else {
+                            self.cross
+                        };
+                        self.pending.push((self.now + lat, i as u32, to, m));
+                    }
+                }
+            }
+        }
+
+        /// One tick: deliver what is due, tick every node, flush.
+        fn step(&mut self) {
+            self.now += 1;
+            let (due, keep): (Vec<_>, Vec<_>) = self
+                .pending
+                .drain(..)
+                .partition(|(t, _, _, _)| *t <= self.now);
+            self.pending = keep;
+            for (_, from, to, m) in due {
+                if let Message::Gossip { round, .. } = &m {
+                    if self.deliverer[to as usize].is_none() {
+                        self.deliverer[to as usize] = Some(from);
+                        self.round[to as usize] = Some(*round);
+                    }
+                }
+                self.nodes[to as usize].on_message(from, m);
+            }
+            for n in self.nodes.iter_mut() {
+                n.tick(1);
+            }
+            self.flush();
+        }
+
+        fn settle(&mut self) {
+            for _ in 0..(4 * self.cross + 40) {
+                self.step();
+            }
+        }
+
+        /// Source `src` broadcasts once; run until every node has it and the network is quiet.
+        fn broadcast(&mut self, src: u32) {
+            self.deliverer.iter_mut().for_each(|d| *d = None);
+            self.round.iter_mut().for_each(|r| *r = None);
+            self.nodes[src as usize].broadcast(vec![src as u8]);
+            self.flush();
+            self.settle();
+        }
+
+        /// The delivery tree of the last message: (parent, child) for every non-source node.
+        fn edges(&self) -> Vec<(u32, u32)> {
+            self.deliverer
+                .iter()
+                .enumerate()
+                .filter_map(|(i, d)| d.map(|p| (p, i as u32)))
+                .collect()
+        }
+
+        fn cross_edges(&self) -> Vec<(u32, u32)> {
+            self.edges()
+                .into_iter()
+                .filter(|&(p, c)| self.dc[p as usize] != self.dc[c as usize])
+                .collect()
+        }
+
+        fn max_round(&self) -> u16 {
+            self.round.iter().flatten().copied().max().unwrap_or(0)
+        }
+
+        fn all_delivered(&self, src: u32) -> bool {
+            self.deliverer
+                .iter()
+                .enumerate()
+                .all(|(i, d)| i as u32 == src || d.is_some())
+        }
+    }
+
+    #[test]
+    fn three_nodes_in_one_domain_form_a_root_with_two_children() {
+        let mut c = Cluster::new(3, 1, 3, 0, 1, 10);
+        for _ in 0..5 {
+            c.broadcast(0);
+        }
+        assert!(c.all_delivered(0));
+        assert_eq!(c.edges(), vec![(0, 1), (0, 2)]);
+        assert_eq!(c.max_round(), 0, "both are the root's children");
+    }
+
+    #[test]
+    fn nine_nodes_in_three_domains_enter_each_domain_once_and_stay_shallow() {
+        // Three per domain, ids 0..9, domain = id % 3, the root in domain 0. The efficient
+        // shape: the root's local children, and one entry into each other domain from which
+        // that domain's two other nodes hang.
+        let mut c = Cluster::new(9, 3, 2, 2, 1, 10);
+        for _ in 0..20 {
+            c.broadcast(0);
+        }
+        assert!(c.all_delivered(0));
+        let cross = c.cross_edges();
+        assert_eq!(cross.len(), 2, "one entry per other domain: {cross:?}");
+        for (p, _) in &cross {
+            assert_eq!(
+                c.dc[*p as usize], 0,
+                "entered from the root's domain: {cross:?}"
+            );
+        }
+        assert!(
+            c.max_round() <= 2,
+            "root, children, grandchildren: {:?}",
+            c.round
+        );
+    }
+
+    #[test]
+    fn two_hundred_nodes_in_three_domains_enter_each_domain_once_and_stay_local() {
+        let mut c = Cluster::new(200, 3, 8, 4, 2, 10);
+        for _ in 0..30 {
+            c.broadcast(0);
+        }
+        assert!(c.all_delivered(0));
+        let cross = c.cross_edges();
+        assert_eq!(cross.len(), 2, "one entry per other domain: {cross:?}");
+        for (p, _) in &cross {
+            assert_eq!(
+                c.dc[*p as usize], 0,
+                "entered from the root's domain: {cross:?}"
+            );
+        }
+        // Everything else is local: a domain's nodes hang off their own entry.
+        assert!(c.max_round() <= 6, "depth {}", c.max_round());
+    }
 }
