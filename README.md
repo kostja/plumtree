@@ -30,17 +30,18 @@ announcer for it with a `GRAFT`, which also makes that link eager. A node that r
 same message twice removes the redundant link with a `PRUNE`. The eager links settle into a
 spanning tree in a round or two; the lazy links stay ready to repair it.
 
-Four messages, then: `GOSSIP { id, payload, round }` where `round` is the hop count from the
+Four messages, then: `GOSSIP { id, payload, round }` where `round` is the distance from the
 source; `IHAVE([(id, round)])`; `GRAFT(Some(id))` to ask for a message, `GRAFT(None)` to make
 the link eager and ask for nothing; and `PRUNE`.
 
 ### The tree follows the sender
 
 Plumtree has no root: each broadcast spreads from its own source over the shared mesh. The
-mesh does tune itself to whoever is sending. Every copy of a message carries its hop count and
-so does every announcement. A node whose eager copy arrived at hop `r`, and which heard of the
-same message from any non-eager peer at hop `r'`, with `r - r' >= swap_threshold`, makes that
-peer eager with a bare `GRAFT` and prunes the old link: the announcer is closer to the source.
+mesh does tune itself to whoever is sending. Every copy of a message carries its distance from
+the source and so does every announcement. A node whose eager copy arrived at distance `r`,
+and which heard of the same message from any non-eager peer at distance `r'`, with
+`r - r' >= swap_threshold`, makes that peer eager with a bare `GRAFT` and prunes the old link:
+the announcer is closer to the source.
 After a few messages from a new source the tree is balanced around it again, at about
 `log N` depth. A Raft leader change costs the leader's next few messages, not a rebuild.
 
@@ -50,15 +51,18 @@ Each peer carries a `Cost`, in hops' worth of latency: `0` for the same failure 
 the latency ratio (10, say) for a link ten times slower. The scale is yours; the crate uses it
 in five places:
 
+- **distance**: a hop over a link of cost `c` counts `c + 1`. The sender puts its own distance
+  plus one in the message, the receiver adds the link's cost. So a path that crosses domains
+  twice is 22 away where a direct cross link is 11, and the swap below sees the difference. A
+  plain hop count would see a gain of one and keep the long path;
+
 - **the starting eager set**: `fanout` peers of cost 0, plus the first peer of each other cost,
   so every other domain is entered once and the message spreads inside it;
 - **which announcer is asked first** for a missing message: the cheapest;
 - **how long to wait before asking**: `graft_timeout` for a cheap announcer, plus its cost for
   a costly one, so a copy over the cheap path has time to arrive;
 - **which of two eager links a duplicate prunes**: the costlier, and between equals the late
-  one;
-- **the swap**: a costlier announcer needs that many more hops of gain to replace an eager
-  link; a cheaper one is taken even that many hops farther out.
+  one.
 
 So a cross-domain link survives only where no local path exists, and a domain is normally
 reached through one entry point. Two things the peer list itself must get right. Keep the lazy
@@ -100,7 +104,7 @@ The id type is generic (`Plumtree<Id>` for any `Ord + Clone`): a `u32` raft id, 
 | field | default | size it to |
 |---|---|---|
 | `fanout` | 3 | about `log2 N + 1`; too small makes the tree deep, and then a costly shortcut looks worth it |
-| `swap_threshold` | 2 | hops of gain before a link is swapped; 1 churns, 3 is slow to rebalance |
+| `swap_threshold` | 2 | distance gained before a link is swapped, in hops within a domain; 1 churns, 3 is slow to rebalance |
 | `graft_timeout` | 500 | longer than a message takes to cross the tree, in your tick unit |
 | `cache_cap` | 512 | messages kept to answer `GRAFT`s; more than can go by in a `graft_timeout` |
 

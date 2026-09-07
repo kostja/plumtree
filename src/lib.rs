@@ -66,16 +66,17 @@
 //!
 //! Plumtree has **no single root**. Each broadcast spreads from its own source over the shared
 //! eager/lazy mesh. The mesh does tune itself to whoever is sending: every message carries its
-//! hop count, lazy announcements carry it too, and a node that hears of a message from a lazy
-//! peer [`Config::swap_threshold`] hops earlier than its eager copy arrived makes that peer
-//! eager and the old link lazy. After a few messages from a new source the tree is balanced
-//! around it again, at about `log N` depth. So a Raft leader change costs the leader's next few
-//! messages, not a rebuild.
+//! distance from the source, lazy announcements carry it too, and a node that hears of a
+//! message from a lazy peer [`Config::swap_threshold`] closer to the source than its eager copy
+//! makes that peer eager and the old link lazy. After a few messages from a new source the tree
+//! is balanced around it again, at about `log N` depth. So a Raft leader change costs the
+//! leader's next few messages, not a rebuild.
 //!
 //! Each peer has a [`Cost`], chosen by the caller: 0 for the same failure domain, more for
-//! another. The tree starts with [`Config::fanout`] cheap eager peers and one eager peer per
-//! other cost, grafts the cheapest announcer first, and needs a larger hop gain to swap in a
-//! costlier peer. A domain is entered once and spread inside.
+//! another. Distance counts hops, and a hop over a link of cost `c` counts `c + 1`, so a path
+//! that crosses domains twice is far and a swap sees it. The tree starts with
+//! [`Config::fanout`] cheap eager peers and one eager peer per other cost, and grafts the
+//! cheapest announcer first. A domain is entered once and spread inside.
 //!
 //! A rooted, directed tree — for handing quota leases *down* from the leader — is a separate
 //! layer built on top: it follows the peer that delivers the leader's messages.
@@ -130,13 +131,14 @@ pub enum Message<Id> {
         id: MsgId<Id>,
         /// The payload -- opaque to this crate.
         payload: Vec<u8>,
-        /// How many hops from the origin. The tree is tuned on it: a node that hears of a
-        /// message from a lazy peer at a much lower hop count than its eager copy arrived at
-        /// swaps the two links.
+        /// Distance from the origin: hops, a hop over a link of cost `c` counting `c + 1`. The
+        /// sender puts its own distance plus one; the receiver adds the link's cost. The tree
+        /// is tuned on it: a node that hears of a message from a lazy peer much closer to the
+        /// origin than its eager copy swaps the two links.
         round: u16,
     },
-    /// Ids a lazy peer has, with the hop count it got each at, announced so a node missing one
-    /// can ask for it, and so a node with a long eager path can find a shorter one.
+    /// Ids a lazy peer has, with its distance from the origin for each, announced so a node
+    /// missing one can ask for it, and so a node with a long eager path can find a shorter one.
     Ihave(Vec<(MsgId<Id>, u16)>),
     /// Make this link eager. With an id: also send me that message, which I heard of but did
     /// not get. Without: I have everything; you are just closer to the source than my current
@@ -196,7 +198,7 @@ struct Missing<Id> {
 /// A message this node has.
 struct Cached<Id> {
     payload: Vec<u8>,
-    /// The hop count it arrived at.
+    /// Its distance from the origin here.
     round: u16,
     /// The eager peer it came from; `None` if this node broadcast it.
     from: Option<Id>,
@@ -401,6 +403,8 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     }
 
     fn on_gossip(&mut self, from: Id, id: MsgId<Id>, payload: Vec<u8>, round: u16) {
+        // The distance here: a hop over a costly link counts its cost extra.
+        let round = round.saturating_add(u16::from(self.cost_of(&from)));
         if let Some(c) = self.cache.get(&id) {
             // A duplicate: one of the two eager links is redundant. Drop the costlier one, and
             // between equals the one that was late.
@@ -440,7 +444,10 @@ impl<Id: Ord + Clone> Plumtree<Id> {
     }
 
     fn on_ihave(&mut self, from: Id, ids: Vec<(MsgId<Id>, u16)>) {
+        let cost = self.cost_of(&from);
         for (id, r) in ids {
+            // What a copy from this announcer would arrive at.
+            let r = r.saturating_add(u16::from(cost));
             if let Some(c) = self.cache.get(&id) {
                 // Already have it. If it came by a much longer eager path, swap.
                 if let (Some(via), round) = (c.from.clone(), c.round) {
@@ -448,7 +455,6 @@ impl<Id: Ord + Clone> Plumtree<Id> {
                 }
                 continue;
             }
-            let cost = self.cost_of(&from);
             let ready = self.now + self.cfg.graft_timeout + u64::from(cost);
             let entry = self.missing.entry(id).or_insert_with(|| Missing {
                 announcers: VecDeque::new(),
@@ -463,19 +469,15 @@ impl<Id: Ord + Clone> Plumtree<Id> {
         }
     }
 
-    /// The optimisation step of the paper: `lazy` heard the message at hop `lazy_round`, our
-    /// eager copy from `via` arrived at hop `round`. If the gap clears the threshold, adjusted
-    /// for cost, make `lazy` eager and `via` lazy. Cost is hops' worth: a peer cheaper by 10
-    /// is taken even 8 hops farther out, and a peer costlier by 10 needs 12 hops of gain.
-    /// Returns whether it did.
+    /// The optimisation step of the paper: a copy from `lazy` would arrive at distance
+    /// `lazy_round`, our eager copy from `via` arrived at `round`. If the gap clears the
+    /// threshold, make `lazy` eager and `via` lazy. Distances already carry link costs, so a
+    /// costly shortcut only wins when it is really shorter. Returns whether it did.
     fn try_swap(&mut self, via: &Id, round: u16, lazy: &Id, lazy_round: u16) -> bool {
         if lazy == via || self.eager.contains(lazy) || !self.eager.contains(via) {
             return false;
         }
-        let bar = i32::from(self.cfg.swap_threshold) + i32::from(self.cost_of(lazy))
-            - i32::from(self.cost_of(via));
-        let gain = i32::from(round) - i32::from(lazy_round);
-        if gain < bar {
+        if round.saturating_sub(lazy_round) < self.cfg.swap_threshold {
             return false;
         }
         self.graft_in(lazy);
@@ -1105,7 +1107,7 @@ mod tests {
         dead: Vec<bool>,
         now: u64,
         pending: Vec<(u64, u32, u32, Message<u32>)>,
-        /// For the latest message: who delivered it to each node, and at what hop.
+        /// For the latest message: who delivered it to each node, and how many hops deep.
         deliverer: Vec<Option<u32>>,
         round: Vec<Option<u16>>,
     }
@@ -1256,10 +1258,11 @@ mod tests {
                 .partition(|(t, _, _, _)| *t <= self.now);
             self.pending = keep;
             for (_, from, to, m) in due {
-                if let Message::Gossip { round, .. } = &m {
+                if let Message::Gossip { .. } = &m {
                     if self.deliverer[to as usize].is_none() {
                         self.deliverer[to as usize] = Some(from);
-                        self.round[to as usize] = Some(*round);
+                        let depth = self.round[from as usize].map_or(0, |r| r + 1);
+                        self.round[to as usize] = Some(depth);
                     }
                 }
                 self.nodes[to as usize].on_message(from, m);
@@ -1280,6 +1283,7 @@ mod tests {
         fn broadcast(&mut self, src: u32) {
             self.deliverer.iter_mut().for_each(|d| *d = None);
             self.round.iter_mut().for_each(|r| *r = None);
+            self.round[src as usize] = Some(0);
             self.nodes[src as usize].broadcast(vec![src as u8]);
             self.flush();
             self.settle();
@@ -1301,6 +1305,7 @@ mod tests {
                 .collect()
         }
 
+        /// The deepest node, in hops.
         fn max_round(&self) -> u16 {
             self.round.iter().flatten().copied().max().unwrap_or(0)
         }
@@ -1337,7 +1342,7 @@ mod tests {
         }
         assert!(c.all_delivered(0));
         assert_eq!(c.edges(), vec![(0, 1), (0, 2)]);
-        assert_eq!(c.max_round(), 0, "both are the root's children");
+        assert_eq!(c.max_round(), 1, "both are the root's children");
     }
 
     #[test]
@@ -1370,13 +1375,11 @@ mod tests {
         assert!(c.max_round() <= 6, "depth {}", c.max_round());
     }
 
-    /// Fails today. With the root in domain 1, domain 2 is entered from domain 0: the path
-    /// 1 -> 3 -> 2 crosses twice (latency 21) where 1 -> 2 crosses once (latency 10). The
-    /// hop-count optimisation sees a gain of one hop, below the threshold of two, and the
-    /// cost of the two links is equal, so nothing swaps. Rounds would have to count latency,
-    /// not hops, for this shape to be repaired.
+    /// With plain hop counts this failed: domain 2 was entered from domain 0, the path
+    /// 1 -> 3 -> 2 crossing twice (latency 21) where 1 -> 2 crosses once (latency 10). A gain
+    /// of one hop was below the threshold, and both links cost the same. Distance weighted by
+    /// cost sees 21 against 10 and swaps.
     #[test]
-    #[ignore = "hop counts cannot see path cost; see the doc comment"]
     fn a_root_in_another_domain_re_forms_the_entries_from_its_own() {
         // The leader-change case: a tree built around a root in domain 0, then the source
         // moves to domain 1.
