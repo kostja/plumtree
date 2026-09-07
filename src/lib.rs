@@ -1089,15 +1089,20 @@ mod tests {
     }
 
     // ---------------------------------------------------------------- shape
-
     /// A deterministic cluster over failure domains: latency 1 within a domain, `cross`
-    /// across, no loss. Peers are what a caller would give: every node knows a few random
-    /// peers in its own domain; the lowest `gateways` ids of each domain also know the
+    /// across, a fixed loss rate. Peers are what a caller would give: every node knows a few
+    /// random peers in its own domain; the lowest `gateways` ids of each domain also know the
     /// lowest id of every other domain, at cost `cross`.
     struct Cluster {
         nodes: Vec<Plumtree<u32>>,
         dc: Vec<u8>,
+        dcs: u8,
+        fanout: usize,
+        lazy: usize,
         cross: u64,
+        loss: f64,
+        seed: u64,
+        dead: Vec<bool>,
         now: u64,
         pending: Vec<(u64, u32, u32, Message<u32>)>,
         /// For the latest message: who delivered it to each node, and at what hop.
@@ -1107,58 +1112,130 @@ mod tests {
 
     impl Cluster {
         fn new(n: u32, dcs: u8, fanout: usize, lazy: usize, gateways: u32, cross: u64) -> Self {
-            let dc_of = |id: u32| (id % u32::from(dcs)) as u8;
-            let mut seed = 0x5EEDu64;
-            let mut rnd = move |m: usize| -> usize {
-                seed = seed
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                ((seed >> 33) % m as u64) as usize
-            };
-            let mut nodes = Vec::new();
-            for id in 0..n {
-                let mine: Vec<u32> = (0..n)
-                    .filter(|&q| q != id && dc_of(q) == dc_of(id))
-                    .collect();
-                let mut peers: Vec<(u32, Cost)> = Vec::new();
-                let mut pool = mine.clone();
-                while peers.len() < (fanout + lazy).min(mine.len()) {
-                    let k = rnd(pool.len());
-                    peers.push((pool.remove(k), 0));
-                }
-                if id / u32::from(dcs) < gateways {
-                    for d in 0..dcs {
-                        if d != dc_of(id) {
-                            let entry = (0..n).find(|&q| dc_of(q) == d).unwrap();
-                            peers.push((entry, cross as Cost));
-                        }
-                    }
-                }
-                let cfg = Config {
-                    graft_timeout: 8,
-                    fanout,
-                    ..Config::default()
-                };
-                nodes.push(Plumtree::new(id, peers, cfg));
-            }
+            Self::with_loss(n, dcs, fanout, lazy, gateways, cross, 0.0)
+        }
+
+        fn with_loss(
+            n: u32,
+            dcs: u8,
+            fanout: usize,
+            lazy: usize,
+            gateways: u32,
+            cross: u64,
+            loss: f64,
+        ) -> Self {
             let mut c = Cluster {
-                nodes,
-                dc: (0..n).map(dc_of).collect(),
+                nodes: Vec::new(),
+                dc: Vec::new(),
+                dcs,
+                fanout,
+                lazy,
                 cross,
+                loss,
+                seed: 0x5EED,
+                dead: Vec::new(),
                 now: 0,
                 pending: Vec::new(),
-                deliverer: vec![None; n as usize],
-                round: vec![None; n as usize],
+                deliverer: Vec::new(),
+                round: Vec::new(),
             };
+            for id in 0..n {
+                let gateway = id / u32::from(dcs) < gateways;
+                c.add(id, gateway, n);
+            }
             c.flush();
             c.settle();
             c
         }
 
+        fn rnd(&mut self, m: usize) -> usize {
+            self.seed = self
+                .seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((self.seed >> 33) % m as u64) as usize
+        }
+
+        fn dc_of(&self, id: u32) -> u8 {
+            (id % u32::from(self.dcs)) as u8
+        }
+
+        /// A node with the peers a caller would give it, chosen among the ids below `known`.
+        fn add(&mut self, id: u32, gateway: bool, known: u32) {
+            let dc = self.dc_of(id);
+            let mine: Vec<u32> = (0..known)
+                .filter(|&q| q != id && self.dc_of(q) == dc)
+                .collect();
+            let mut peers: Vec<(u32, Cost)> = Vec::new();
+            let mut pool = mine.clone();
+            while peers.len() < (self.fanout + self.lazy).min(mine.len()) {
+                let k = self.rnd(pool.len());
+                peers.push((pool.remove(k), 0));
+            }
+            if gateway {
+                for d in 0..self.dcs {
+                    if d != dc {
+                        let entry = (0..known).find(|&q| self.dc_of(q) == d).unwrap();
+                        peers.push((entry, self.cross as Cost));
+                    }
+                }
+            }
+            let cfg = Config {
+                graft_timeout: 8,
+                fanout: self.fanout,
+                ..Config::default()
+            };
+            self.nodes.push(Plumtree::new(id, peers, cfg));
+            self.dc.push(dc);
+            self.dead.push(false);
+            self.deliverer.push(None);
+            self.round.push(None);
+        }
+
+        /// A node joins its domain knowing a few local peers. Everyone else only learns its
+        /// cost; the node introduces itself.
+        fn join(&mut self, id: u32) {
+            let n = self.nodes.len() as u32;
+            assert_eq!(id, n);
+            self.add(id, false, n);
+            let dc = self.dc_of(id);
+            for j in 0..n as usize {
+                let cost = if self.dc[j] == dc {
+                    0
+                } else {
+                    self.cross as Cost
+                };
+                self.nodes[j].membership(&[(id, cost)], &[]);
+            }
+            self.flush();
+            self.settle();
+        }
+
+        /// The failure detector's verdict: `id` is down, and every node is told.
+        fn kill(&mut self, id: u32) {
+            self.dead[id as usize] = true;
+            for j in 0..self.nodes.len() {
+                if j as u32 != id {
+                    self.nodes[j].down(&[id]);
+                }
+            }
+            self.pending.retain(|(_, f, t, _)| *f != id && *t != id);
+        }
+
         fn flush(&mut self) {
             for i in 0..self.nodes.len() {
-                for a in self.nodes[i].ready() {
+                let out = self.nodes[i].ready();
+                if self.dead[i] {
+                    continue;
+                }
+                for a in out {
                     if let Action::Send(to, m) = a {
+                        if self.dead[to as usize] {
+                            continue;
+                        }
+                        if self.loss > 0.0 && (self.rnd(10_000) as f64) < self.loss * 10_000.0 {
+                            continue;
+                        }
                         let lat = if self.dc[i] == self.dc[to as usize] {
                             1
                         } else {
@@ -1232,7 +1309,23 @@ mod tests {
             self.deliverer
                 .iter()
                 .enumerate()
-                .all(|(i, d)| i as u32 == src || d.is_some())
+                .all(|(i, d)| i as u32 == src || self.dead[i] || d.is_some())
+        }
+
+        /// The entries are exactly one per other domain, all from the root's domain.
+        fn assert_entered_once_from(&self, root_dc: u8) {
+            let cross = self.cross_edges();
+            assert_eq!(
+                cross.len(),
+                usize::from(self.dcs) - 1,
+                "one entry per other domain: {cross:?}"
+            );
+            for (p, _) in &cross {
+                assert_eq!(
+                    self.dc[*p as usize], root_dc,
+                    "entered from the root's domain: {cross:?}"
+                );
+            }
         }
     }
 
@@ -1257,14 +1350,7 @@ mod tests {
             c.broadcast(0);
         }
         assert!(c.all_delivered(0));
-        let cross = c.cross_edges();
-        assert_eq!(cross.len(), 2, "one entry per other domain: {cross:?}");
-        for (p, _) in &cross {
-            assert_eq!(
-                c.dc[*p as usize], 0,
-                "entered from the root's domain: {cross:?}"
-            );
-        }
+        c.assert_entered_once_from(0);
         assert!(
             c.max_round() <= 2,
             "root, children, grandchildren: {:?}",
@@ -1279,15 +1365,96 @@ mod tests {
             c.broadcast(0);
         }
         assert!(c.all_delivered(0));
-        let cross = c.cross_edges();
-        assert_eq!(cross.len(), 2, "one entry per other domain: {cross:?}");
-        for (p, _) in &cross {
-            assert_eq!(
-                c.dc[*p as usize], 0,
-                "entered from the root's domain: {cross:?}"
-            );
-        }
+        c.assert_entered_once_from(0);
         // Everything else is local: a domain's nodes hang off their own entry.
         assert!(c.max_round() <= 6, "depth {}", c.max_round());
+    }
+
+    /// Fails today. With the root in domain 1, domain 2 is entered from domain 0: the path
+    /// 1 -> 3 -> 2 crosses twice (latency 21) where 1 -> 2 crosses once (latency 10). The
+    /// hop-count optimisation sees a gain of one hop, below the threshold of two, and the
+    /// cost of the two links is equal, so nothing swaps. Rounds would have to count latency,
+    /// not hops, for this shape to be repaired.
+    #[test]
+    #[ignore = "hop counts cannot see path cost; see the doc comment"]
+    fn a_root_in_another_domain_re_forms_the_entries_from_its_own() {
+        // The leader-change case: a tree built around a root in domain 0, then the source
+        // moves to domain 1.
+        let mut c = Cluster::new(200, 3, 8, 4, 2, 10);
+        for _ in 0..10 {
+            c.broadcast(0);
+        }
+        for _ in 0..30 {
+            c.broadcast(1);
+        }
+        assert!(c.all_delivered(1));
+        c.assert_entered_once_from(1);
+        assert!(c.max_round() <= 6, "depth {}", c.max_round());
+    }
+
+    #[test]
+    fn a_dead_gateway_is_replaced_by_the_other_one_and_the_domain_stays_local() {
+        let mut c = Cluster::new(200, 3, 8, 4, 2, 10);
+        for _ in 0..30 {
+            c.broadcast(0);
+        }
+        let entry = c
+            .cross_edges()
+            .into_iter()
+            .find(|&(_, ch)| c.dc[ch as usize] == 1)
+            .map(|(_, ch)| ch)
+            .expect("domain 1 has an entry");
+        c.kill(entry);
+        for _ in 0..30 {
+            c.broadcast(0);
+        }
+        assert!(c.all_delivered(0), "domain 1 is reached again");
+        c.assert_entered_once_from(0);
+        let new_entry = c
+            .cross_edges()
+            .into_iter()
+            .find(|&(_, ch)| c.dc[ch as usize] == 1)
+            .map(|(_, ch)| ch)
+            .unwrap();
+        assert_ne!(new_entry, entry);
+        assert!(c.max_round() <= 6, "depth {}", c.max_round());
+    }
+
+    #[test]
+    fn a_joined_node_hangs_off_a_local_peer() {
+        let mut c = Cluster::new(200, 3, 8, 4, 2, 10);
+        for _ in 0..30 {
+            c.broadcast(0);
+        }
+        c.join(200); // domain 200 % 3 = 2
+        for _ in 0..10 {
+            c.broadcast(0);
+        }
+        assert!(c.all_delivered(0));
+        let from = c.deliverer[200].expect("delivered");
+        assert_eq!(c.dc[from as usize], 2, "from its own domain, not across");
+        c.assert_entered_once_from(0);
+    }
+
+    #[test]
+    fn the_shape_holds_under_loss() {
+        let mut c = Cluster::with_loss(200, 3, 8, 4, 2, 10, 0.05);
+        for _ in 0..30 {
+            c.broadcast(0);
+        }
+        let mut crossings = Vec::new();
+        let mut reached = 0;
+        for _ in 0..10 {
+            c.broadcast(0);
+            crossings.push(c.cross_edges().len());
+            reached += usize::from(c.all_delivered(0));
+        }
+        assert!(reached >= 9, "every node reached in {reached} of 10");
+        let tight = crossings.iter().filter(|&&k| k == 2).count();
+        assert!(
+            tight >= 7,
+            "two cross edges in {tight} of 10: {crossings:?}"
+        );
+        assert!(crossings.iter().all(|&k| k <= 4), "{crossings:?}");
     }
 }
