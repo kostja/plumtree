@@ -15,3 +15,10 @@ authors = ["Konstantin Osipov <kostja.osipov@gmail.com>"]
 
 [dev-dependencies]
 proptest = "1"
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+
+[features]
+## `Serialize`/`Deserialize` on the wire types, for a transport that uses serde.
+serde = ["dep:serde"]

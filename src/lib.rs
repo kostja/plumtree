@@ -124,6 +124,7 @@ pub type Cost = u8;
 /// A message between nodes. The caller serializes and sends it; on receipt it feeds it back in
 /// through [`Plumtree::on_message`].
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Message<Id> {
     /// A full message on an eager link.
     Gossip {
